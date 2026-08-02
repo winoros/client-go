@@ -423,6 +423,11 @@ func collectBatchGetResponseData(
 	default:
 		return nil, errors.Errorf("unknown response %T", v)
 	}
+	// A response with a recognized body is complete for scan-detail coverage,
+	// even when it carries no ExecDetailsV2 or contains a key error. Record it
+	// before parsing the payload so retries and their scan details use the same
+	// response-level aggregation boundary.
+	onDetails(details)
 	if data.keyErr != nil {
 		// If a response-level error happens, skip reading pairs.
 		lock, err := txnlock.ExtractLockFromKeyErr(data.keyErr)
@@ -456,7 +461,6 @@ func collectBatchGetResponseData(
 		}
 		readSize := float64(details.GetScanDetailV2().GetProcessedVersionsSize())
 		metrics.ObserveReadSLI(uint64(readKeys), readTime, readSize)
-		onDetails(details)
 	}
 	return data, nil
 }
@@ -876,6 +880,7 @@ func (s *KVSnapshot) get(ctx context.Context, bo *retry.Backoffer, k []byte, opt
 			return kv.ValueEntry{}, errors.WithStack(tikverr.ErrBodyMissing)
 		}
 		cmdGetResp := resp.Resp.(*kvrpcpb.GetResponse)
+		s.mergeExecDetail(cmdGetResp.ExecDetailsV2)
 		if cmdGetResp.ExecDetailsV2 != nil {
 			readKeys := len(cmdGetResp.Value)
 			var readTime float64
@@ -886,7 +891,6 @@ func (s *KVSnapshot) get(ctx context.Context, bo *retry.Backoffer, k []byte, opt
 			}
 			readSize := float64(cmdGetResp.ExecDetailsV2.GetScanDetailV2().GetProcessedVersionsSize())
 			metrics.ObserveReadSLI(uint64(readKeys), readTime, readSize)
-			s.mergeExecDetail(cmdGetResp.ExecDetailsV2)
 		}
 		val := cmdGetResp.GetValue()
 		commitTS := cmdGetResp.GetCommitTs()
@@ -943,10 +947,13 @@ func (s *KVSnapshot) get(ctx context.Context, bo *retry.Backoffer, k []byte, opt
 func (s *KVSnapshot) mergeExecDetail(detail *kvrpcpb.ExecDetailsV2) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if detail == nil || s.mu.stats == nil {
+	if s.mu.stats == nil {
 		return
 	}
-	s.mu.stats.scanDetail.MergeFromScanDetailV2(detail.ScanDetailV2)
+	s.mu.stats.recordScanDetail(detail)
+	if detail == nil {
+		return
+	}
 	s.mu.stats.timeDetail.MergeFromTimeDetail(detail.TimeDetailV2, detail.TimeDetail)
 }
 
@@ -1277,20 +1284,26 @@ func (s *KVSnapshot) SetPipelined(ts uint64) {
 
 // SnapshotRuntimeStats records the runtime stats of snapshot.
 type SnapshotRuntimeStats struct {
-	rpcStats          *locate.RegionRequestRuntimeStats
-	backoffSleepMS    map[string]int
-	backoffTimes      map[string]int
-	scanDetail        util.ScanDetail
-	timeDetail        util.TimeDetail
-	resolveLockDetail util.ResolveLockDetail
+	rpcStats            *locate.RegionRequestRuntimeStats
+	backoffSleepMS      map[string]int
+	backoffTimes        map[string]int
+	scanDetailMu        sync.RWMutex
+	scanDetail          util.ScanDetail
+	detailRecords       uint64
+	completedResponses  uint64
+	timeDetail          util.TimeDetail
+	resolveLockDetail   util.ResolveLockDetail
 }
 
 // Clone implements the RuntimeStats interface.
 func (rs *SnapshotRuntimeStats) Clone() *SnapshotRuntimeStats {
+	scanDetail, detailRecords, completedResponses := rs.scanDetailSnapshot()
 	newRs := SnapshotRuntimeStats{
-		scanDetail:        rs.scanDetail,
-		timeDetail:        rs.timeDetail,
-		resolveLockDetail: rs.resolveLockDetail,
+		scanDetail:          scanDetail,
+		detailRecords:       detailRecords,
+		completedResponses:  completedResponses,
+		timeDetail:          rs.timeDetail,
+		resolveLockDetail:   rs.resolveLockDetail,
 	}
 	if rs.rpcStats != nil {
 		newRs.rpcStats = rs.rpcStats.Clone()
@@ -1330,7 +1343,12 @@ func (rs *SnapshotRuntimeStats) Merge(other *SnapshotRuntimeStats) {
 			rs.backoffTimes[k] += v
 		}
 	}
-	rs.scanDetail.Merge(&other.scanDetail)
+	otherScanDetail, otherDetailRecords, otherCompletedResponses := other.scanDetailSnapshot()
+	rs.scanDetailMu.Lock()
+	rs.scanDetail.Merge(&otherScanDetail)
+	rs.detailRecords += otherDetailRecords
+	rs.completedResponses += otherCompletedResponses
+	rs.scanDetailMu.Unlock()
 	rs.timeDetail.Merge(&other.timeDetail)
 	rs.resolveLockDetail.Merge(&other.resolveLockDetail)
 }
@@ -1364,12 +1382,53 @@ func (rs *SnapshotRuntimeStats) String() string {
 		buf.WriteString("resolve_lock_time:")
 		buf.WriteString(util.FormatDuration(time.Duration(rs.resolveLockDetail.ResolveLockTime)))
 	}
-	scanDetail := rs.scanDetail.String()
+	scanDetailSnapshot, _, _ := rs.scanDetailSnapshot()
+	scanDetail := scanDetailSnapshot.String()
 	if scanDetail != "" {
 		buf.WriteString(", ")
 		buf.WriteString(scanDetail)
 	}
 	return buf.String()
+}
+
+func (rs *SnapshotRuntimeStats) recordScanDetail(detail *kvrpcpb.ExecDetailsV2) {
+	rs.scanDetailMu.Lock()
+	defer rs.scanDetailMu.Unlock()
+
+	rs.completedResponses++
+	if detail == nil || detail.ScanDetailV2 == nil {
+		return
+	}
+	rs.detailRecords++
+	rs.scanDetail.MergeFromScanDetailV2(detail.ScanDetailV2)
+}
+
+func (rs *SnapshotRuntimeStats) scanDetailSnapshot() (util.ScanDetail, uint64, uint64) {
+	rs.scanDetailMu.RLock()
+	defer rs.scanDetailMu.RUnlock()
+	return rs.scanDetail, rs.detailRecords, rs.completedResponses
+}
+
+// GetScanDetailAndCoverage returns the aggregated Get and BatchGet scan detail
+// together with response-level ScanDetailV2 coverage. Only TotalKeys,
+// ProcessedKeys, and ProcessedKeysSize are populated in detail.
+//
+// completedResponses counts responses with a recognized Get, BatchGet, or
+// BufferBatchGet body after transport and region errors have been handled.
+// Empty and key-error responses count. A retry response also counts because its
+// scan detail, when present, is included in the aggregate. detailRecords counts
+// the completed responses that carry ScanDetailV2; it does not imply that every
+// ScanDetailV2 field is supported by the backend.
+func (rs *SnapshotRuntimeStats) GetScanDetailAndCoverage() (
+	detail util.ScanDetail,
+	detailRecords uint64,
+	completedResponses uint64,
+) {
+	scanDetail, detailRecords, completedResponses := rs.scanDetailSnapshot()
+	detail.TotalKeys = scanDetail.TotalKeys
+	detail.ProcessedKeys = scanDetail.ProcessedKeys
+	detail.ProcessedKeysSize = scanDetail.ProcessedKeysSize
+	return detail, detailRecords, completedResponses
 }
 
 // GetTimeDetail returns the timeDetail
