@@ -44,6 +44,7 @@ import (
 	"time"
 
 	"github.com/pingcap/failpoint"
+	"github.com/pingcap/kvproto/pkg/errorpb"
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/pkg/errors"
@@ -567,6 +568,112 @@ func (s *testSnapshotSuite) TestSnapshotRuntimeStatsGetAndBatchGetCoverage() {
 	s.Equal(int64(70), detail.ProcessedKeysSize)
 	s.Equal(uint64(2), detailRecords)
 	s.Equal(uint64(3), completedResponses)
+}
+
+func (s *testSnapshotSuite) TestSnapshotRuntimeStatsExcludesEpochNotMatch() {
+	ctx := context.Background()
+	key := encodeKey(s.prefix, "runtime_stats_epoch_not_match")
+	txn := s.beginTxn()
+	s.Nil(txn.Set(key, []byte("value")))
+	s.Nil(txn.Commit(ctx))
+
+	snapshot := s.store.GetSnapshot(math.MaxUint64)
+	runtimeStats := &txnkv.SnapshotRuntimeStats{}
+	snapshot.SetRuntimeStats(runtimeStats)
+
+	getAttempts := 0
+	fn := func(next interceptor.RPCInterceptorFunc) interceptor.RPCInterceptorFunc {
+		return func(target string, req *tikvrpc.Request) (*tikvrpc.Response, error) {
+			if req.Type == tikvrpc.CmdGet {
+				getAttempts++
+				if getAttempts == 1 {
+					return &tikvrpc.Response{Resp: &kvrpcpb.GetResponse{RegionError: &errorpb.Error{
+						EpochNotMatch: &errorpb.EpochNotMatch{},
+					}}}, nil
+				}
+			}
+			resp, err := next(target, req)
+			if err == nil && resp != nil && req.Type == tikvrpc.CmdGet {
+				body := resp.Resp.(*kvrpcpb.GetResponse)
+				body.ExecDetailsV2 = &kvrpcpb.ExecDetailsV2{ScanDetailV2: &kvrpcpb.ScanDetailV2{
+					TotalVersions: 1, ProcessedVersions: 1, ProcessedVersionsSize: 10,
+				}}
+			}
+			return resp, err
+		}
+	}
+	snapshot.SetRPCInterceptor(interceptor.NewRPCInterceptor("scan-detail-epoch-not-match", fn))
+
+	entry, err := snapshot.Get(ctx, key)
+	s.Nil(err)
+	s.Equal([]byte("value"), entry.Value)
+	s.Equal(2, getAttempts)
+	detail, detailRecords, completedResponses := runtimeStats.GetScanDetailAndCoverage()
+	s.Equal(int64(1), detail.TotalKeys)
+	s.Equal(int64(1), detail.ProcessedKeys)
+	s.Equal(int64(10), detail.ProcessedKeysSize)
+	s.Equal(uint64(1), detailRecords)
+	s.Equal(uint64(1), completedResponses)
+}
+
+func (s *testSnapshotSuite) TestSnapshotRuntimeStatsPointGetLockRetryCoverage() {
+	ctx := context.Background()
+	key := encodeKey(s.prefix, "runtime_stats_point_lock_retry")
+	txn := s.beginTxn()
+	s.Nil(txn.Set(key, []byte("old-value")))
+	s.Nil(txn.Commit(ctx))
+
+	lockingTxn := s.beginTxn()
+	s.Nil(lockingTxn.Set(key, []byte("locked-value")))
+	committer, err := lockingTxn.NewCommitter(1)
+	s.Nil(err)
+	s.Nil(committer.PrewriteAllMutations(ctx))
+	defer committer.Cleanup(ctx)
+
+	readTxn := s.beginTxn()
+	snapshot := readTxn.GetSnapshot()
+	runtimeStats := &txnkv.SnapshotRuntimeStats{}
+	snapshot.SetRuntimeStats(runtimeStats)
+	lockedResponseSeen := make(chan struct{})
+	cleanupDone := make(chan struct{})
+	go func() {
+		<-lockedResponseSeen
+		committer.Cleanup(ctx)
+		close(cleanupDone)
+	}()
+
+	getResponses := 0
+	var signalLockResponse sync.Once
+	fn := func(next interceptor.RPCInterceptorFunc) interceptor.RPCInterceptorFunc {
+		return func(target string, req *tikvrpc.Request) (*tikvrpc.Response, error) {
+			resp, err := next(target, req)
+			if err != nil || resp == nil || req.Type != tikvrpc.CmdGet {
+				return resp, err
+			}
+			body := resp.Resp.(*kvrpcpb.GetResponse)
+			getResponses++
+			body.ExecDetailsV2 = &kvrpcpb.ExecDetailsV2{ScanDetailV2: &kvrpcpb.ScanDetailV2{
+				TotalVersions: 2, ProcessedVersions: 1, ProcessedVersionsSize: 10,
+			}}
+			if body.GetError() != nil && body.GetError().GetLocked() != nil {
+				signalLockResponse.Do(func() { close(lockedResponseSeen) })
+				<-cleanupDone
+			}
+			return resp, err
+		}
+	}
+	snapshot.SetRPCInterceptor(interceptor.NewRPCInterceptor("scan-detail-point-lock-retry", fn))
+
+	entry, err := snapshot.Get(ctx, key)
+	s.Nil(err)
+	s.Equal([]byte("old-value"), entry.Value)
+	s.Equal(2, getResponses)
+	detail, detailRecords, completedResponses := runtimeStats.GetScanDetailAndCoverage()
+	s.Equal(int64(4), detail.TotalKeys)
+	s.Equal(int64(2), detail.ProcessedKeys)
+	s.Equal(int64(20), detail.ProcessedKeysSize)
+	s.Equal(uint64(2), detailRecords)
+	s.Equal(uint64(2), completedResponses)
 }
 
 func (s *testSnapshotSuite) TestSnapshotRuntimeStatsAsyncBatchGetMultipleRegionsCoverage() {

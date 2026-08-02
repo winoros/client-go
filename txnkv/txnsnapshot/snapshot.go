@@ -1284,26 +1284,28 @@ func (s *KVSnapshot) SetPipelined(ts uint64) {
 
 // SnapshotRuntimeStats records the runtime stats of snapshot.
 type SnapshotRuntimeStats struct {
-	rpcStats            *locate.RegionRequestRuntimeStats
-	backoffSleepMS      map[string]int
-	backoffTimes        map[string]int
-	scanDetailMu        sync.RWMutex
-	scanDetail          util.ScanDetail
-	detailRecords       uint64
-	completedResponses  uint64
-	timeDetail          util.TimeDetail
-	resolveLockDetail   util.ResolveLockDetail
+	rpcStats           *locate.RegionRequestRuntimeStats
+	backoffSleepMS     map[string]int
+	backoffTimes       map[string]int
+	scanDetailMu       sync.RWMutex
+	scanDetail         util.ScanDetail
+	detailRecords      uint64
+	completedResponses uint64
+	scanDetailInvalid  bool
+	timeDetail         util.TimeDetail
+	resolveLockDetail  util.ResolveLockDetail
 }
 
 // Clone implements the RuntimeStats interface.
 func (rs *SnapshotRuntimeStats) Clone() *SnapshotRuntimeStats {
-	scanDetail, detailRecords, completedResponses := rs.scanDetailSnapshot()
+	scanDetail, detailRecords, completedResponses, scanDetailInvalid := rs.scanDetailSnapshot()
 	newRs := SnapshotRuntimeStats{
-		scanDetail:          scanDetail,
-		detailRecords:       detailRecords,
-		completedResponses:  completedResponses,
-		timeDetail:          rs.timeDetail,
-		resolveLockDetail:   rs.resolveLockDetail,
+		scanDetail:         scanDetail,
+		detailRecords:      detailRecords,
+		completedResponses: completedResponses,
+		scanDetailInvalid:  scanDetailInvalid,
+		timeDetail:         rs.timeDetail,
+		resolveLockDetail:  rs.resolveLockDetail,
 	}
 	if rs.rpcStats != nil {
 		newRs.rpcStats = rs.rpcStats.Clone()
@@ -1343,11 +1345,18 @@ func (rs *SnapshotRuntimeStats) Merge(other *SnapshotRuntimeStats) {
 			rs.backoffTimes[k] += v
 		}
 	}
-	otherScanDetail, otherDetailRecords, otherCompletedResponses := other.scanDetailSnapshot()
+	otherScanDetail, otherDetailRecords, otherCompletedResponses, otherScanDetailInvalid := other.scanDetailSnapshot()
 	rs.scanDetailMu.Lock()
-	rs.scanDetail.Merge(&otherScanDetail)
-	rs.detailRecords += otherDetailRecords
-	rs.completedResponses += otherCompletedResponses
+	rs.mergeScanDetailDiagnostics(&otherScanDetail)
+	if otherScanDetailInvalid || !rs.mergePointScanDetailAndCoverage(
+		otherScanDetail.TotalKeys,
+		otherScanDetail.ProcessedKeys,
+		otherScanDetail.ProcessedKeysSize,
+		otherDetailRecords,
+		otherCompletedResponses,
+	) {
+		rs.scanDetailInvalid = true
+	}
 	rs.scanDetailMu.Unlock()
 	rs.timeDetail.Merge(&other.timeDetail)
 	rs.resolveLockDetail.Merge(&other.resolveLockDetail)
@@ -1382,7 +1391,7 @@ func (rs *SnapshotRuntimeStats) String() string {
 		buf.WriteString("resolve_lock_time:")
 		buf.WriteString(util.FormatDuration(time.Duration(rs.resolveLockDetail.ResolveLockTime)))
 	}
-	scanDetailSnapshot, _, _ := rs.scanDetailSnapshot()
+	scanDetailSnapshot, _, _, _ := rs.scanDetailSnapshot()
 	scanDetail := scanDetailSnapshot.String()
 	if scanDetail != "" {
 		buf.WriteString(", ")
@@ -1395,18 +1404,114 @@ func (rs *SnapshotRuntimeStats) recordScanDetail(detail *kvrpcpb.ExecDetailsV2) 
 	rs.scanDetailMu.Lock()
 	defer rs.scanDetailMu.Unlock()
 
-	rs.completedResponses++
-	if detail == nil || detail.ScanDetailV2 == nil {
-		return
+	detailRecords := uint64(0)
+	if detail != nil && detail.ScanDetailV2 != nil {
+		detailRecords = 1
+		rs.mergeScanDetailDiagnosticsFromPB(detail.ScanDetailV2)
 	}
-	rs.detailRecords++
-	rs.scanDetail.MergeFromScanDetailV2(detail.ScanDetailV2)
+	if !rs.mergePointScanDetailAndCoverageFromPB(detail, detailRecords, 1) {
+		rs.scanDetailInvalid = true
+	}
 }
 
-func (rs *SnapshotRuntimeStats) scanDetailSnapshot() (util.ScanDetail, uint64, uint64) {
+func (rs *SnapshotRuntimeStats) mergePointScanDetailAndCoverageFromPB(
+	detail *kvrpcpb.ExecDetailsV2,
+	detailRecords uint64,
+	completedResponses uint64,
+) bool {
+	if detail == nil || detail.ScanDetailV2 == nil {
+		return rs.mergePointScanDetailAndCoverage(0, 0, 0, detailRecords, completedResponses)
+	}
+	pointDetail := detail.ScanDetailV2
+	if pointDetail.TotalVersions > math.MaxInt64 ||
+		pointDetail.ProcessedVersions > math.MaxInt64 ||
+		pointDetail.ProcessedVersionsSize > math.MaxInt64 {
+		return false
+	}
+	return rs.mergePointScanDetailAndCoverage(
+		int64(pointDetail.TotalVersions),
+		int64(pointDetail.ProcessedVersions),
+		int64(pointDetail.ProcessedVersionsSize),
+		detailRecords,
+		completedResponses,
+	)
+}
+
+func (rs *SnapshotRuntimeStats) mergePointScanDetailAndCoverage(
+	totalKeys int64,
+	processedKeys int64,
+	processedKeysSize int64,
+	detailRecords uint64,
+	completedResponses uint64,
+) bool {
+	nextTotalKeys, ok := checkedAddNonNegativeInt64(rs.scanDetail.TotalKeys, totalKeys)
+	if !ok {
+		return false
+	}
+	nextProcessedKeys, ok := checkedAddNonNegativeInt64(rs.scanDetail.ProcessedKeys, processedKeys)
+	if !ok {
+		return false
+	}
+	nextProcessedKeysSize, ok := checkedAddNonNegativeInt64(rs.scanDetail.ProcessedKeysSize, processedKeysSize)
+	if !ok {
+		return false
+	}
+	nextDetailRecords, ok := checkedAddUint64(rs.detailRecords, detailRecords)
+	if !ok {
+		return false
+	}
+	nextCompletedResponses, ok := checkedAddUint64(rs.completedResponses, completedResponses)
+	if !ok {
+		return false
+	}
+	rs.scanDetail.TotalKeys = nextTotalKeys
+	rs.scanDetail.ProcessedKeys = nextProcessedKeys
+	rs.scanDetail.ProcessedKeysSize = nextProcessedKeysSize
+	rs.detailRecords = nextDetailRecords
+	rs.completedResponses = nextCompletedResponses
+	return true
+}
+
+func checkedAddNonNegativeInt64(current, delta int64) (int64, bool) {
+	if current < 0 || delta < 0 || delta > math.MaxInt64-current {
+		return 0, false
+	}
+	return current + delta, true
+}
+
+func checkedAddUint64(current, delta uint64) (uint64, bool) {
+	if delta > math.MaxUint64-current {
+		return 0, false
+	}
+	return current + delta, true
+}
+
+func (rs *SnapshotRuntimeStats) mergeScanDetailDiagnosticsFromPB(detail *kvrpcpb.ScanDetailV2) {
+	if detail == nil {
+		return
+	}
+	diagnosticDetail := *detail
+	diagnosticDetail.TotalVersions = 0
+	diagnosticDetail.ProcessedVersions = 0
+	diagnosticDetail.ProcessedVersionsSize = 0
+	rs.scanDetail.MergeFromScanDetailV2(&diagnosticDetail)
+}
+
+func (rs *SnapshotRuntimeStats) mergeScanDetailDiagnostics(detail *util.ScanDetail) {
+	if detail == nil {
+		return
+	}
+	diagnosticDetail := *detail
+	diagnosticDetail.TotalKeys = 0
+	diagnosticDetail.ProcessedKeys = 0
+	diagnosticDetail.ProcessedKeysSize = 0
+	rs.scanDetail.Merge(&diagnosticDetail)
+}
+
+func (rs *SnapshotRuntimeStats) scanDetailSnapshot() (util.ScanDetail, uint64, uint64, bool) {
 	rs.scanDetailMu.RLock()
 	defer rs.scanDetailMu.RUnlock()
-	return rs.scanDetail, rs.detailRecords, rs.completedResponses
+	return rs.scanDetail, rs.detailRecords, rs.completedResponses, rs.scanDetailInvalid
 }
 
 // GetScanDetailAndCoverage returns the aggregated Get and BatchGet scan detail
@@ -1419,16 +1524,34 @@ func (rs *SnapshotRuntimeStats) scanDetailSnapshot() (util.ScanDetail, uint64, u
 // scan detail, when present, is included in the aggregate. detailRecords counts
 // the completed responses that carry ScanDetailV2; it does not imply that every
 // ScanDetailV2 field is supported by the backend.
+//
+// A nil receiver or any overflow in the three detail fields or two coverage
+// counters returns -1 in all three detail fields and zero coverage counters.
+// Callers must treat that sentinel as invalid rather than storage work.
 func (rs *SnapshotRuntimeStats) GetScanDetailAndCoverage() (
 	detail util.ScanDetail,
 	detailRecords uint64,
 	completedResponses uint64,
 ) {
-	scanDetail, detailRecords, completedResponses := rs.scanDetailSnapshot()
+	if rs == nil {
+		return invalidPointScanDetailAndCoverage()
+	}
+	scanDetail, detailRecords, completedResponses, invalid := rs.scanDetailSnapshot()
+	if invalid {
+		return invalidPointScanDetailAndCoverage()
+	}
 	detail.TotalKeys = scanDetail.TotalKeys
 	detail.ProcessedKeys = scanDetail.ProcessedKeys
 	detail.ProcessedKeysSize = scanDetail.ProcessedKeysSize
 	return detail, detailRecords, completedResponses
+}
+
+func invalidPointScanDetailAndCoverage() (util.ScanDetail, uint64, uint64) {
+	return util.ScanDetail{
+		TotalKeys:         -1,
+		ProcessedKeys:     -1,
+		ProcessedKeysSize: -1,
+	}, 0, 0
 }
 
 // GetTimeDetail returns the timeDetail

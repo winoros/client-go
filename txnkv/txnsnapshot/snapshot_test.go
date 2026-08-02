@@ -15,6 +15,7 @@
 package txnsnapshot
 
 import (
+	"math"
 	"sync"
 	"testing"
 
@@ -121,6 +122,122 @@ func TestSnapshotRuntimeStatsScanDetailCloneAndMerge(t *testing.T) {
 	}, detail)
 	require.Equal(t, uint64(3), detailRecords)
 	require.Equal(t, uint64(5), completedResponses)
+}
+
+func TestSnapshotRuntimeStatsScanDetailInvalidSentinel(t *testing.T) {
+	requireInvalid := func(t *testing.T, stats *SnapshotRuntimeStats) {
+		detail, detailRecords, completedResponses := stats.GetScanDetailAndCoverage()
+		require.Equal(t, util.ScanDetail{
+			TotalKeys:         -1,
+			ProcessedKeys:     -1,
+			ProcessedKeysSize: -1,
+		}, detail)
+		require.Zero(t, detailRecords)
+		require.Zero(t, completedResponses)
+	}
+
+	t.Run("nil receiver", func(t *testing.T) {
+		var stats *SnapshotRuntimeStats
+		requireInvalid(t, stats)
+	})
+
+	t.Run("protobuf uint64 conversion", func(t *testing.T) {
+		for _, tc := range []struct {
+			name   string
+			detail *kvrpcpb.ScanDetailV2
+		}{
+			{name: "total versions", detail: &kvrpcpb.ScanDetailV2{TotalVersions: math.MaxUint64}},
+			{name: "processed versions", detail: &kvrpcpb.ScanDetailV2{ProcessedVersions: math.MaxUint64}},
+			{name: "processed versions size", detail: &kvrpcpb.ScanDetailV2{ProcessedVersionsSize: math.MaxUint64}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				stats := &SnapshotRuntimeStats{}
+				newSnapshotWithRuntimeStats(stats).mergeExecDetail(&kvrpcpb.ExecDetailsV2{ScanDetailV2: tc.detail})
+				requireInvalid(t, stats)
+			})
+		}
+	})
+
+	t.Run("single stats multiple responses", func(t *testing.T) {
+		stats := &SnapshotRuntimeStats{}
+		snapshot := newSnapshotWithRuntimeStats(stats)
+		snapshot.mergeExecDetail(&kvrpcpb.ExecDetailsV2{ScanDetailV2: &kvrpcpb.ScanDetailV2{
+			TotalVersions:         math.MaxInt64,
+			ProcessedVersions:     math.MaxInt64,
+			ProcessedVersionsSize: math.MaxInt64,
+			RocksdbBlockReadByte:  1,
+		}})
+		snapshot.mergeExecDetail(&kvrpcpb.ExecDetailsV2{ScanDetailV2: &kvrpcpb.ScanDetailV2{
+			TotalVersions:         1,
+			ProcessedVersions:     1,
+			ProcessedVersionsSize: 1,
+			RocksdbBlockReadByte:  2,
+		}})
+		requireInvalid(t, stats)
+		internalDetail, _, _, invalid := stats.scanDetailSnapshot()
+		require.True(t, invalid)
+		require.Equal(t, uint64(3), internalDetail.RocksdbBlockReadByte)
+		requireInvalid(t, stats.Clone())
+	})
+
+	t.Run("merge detail overflow", func(t *testing.T) {
+		target := &SnapshotRuntimeStats{}
+		newSnapshotWithRuntimeStats(target).mergeExecDetail(&kvrpcpb.ExecDetailsV2{
+			ScanDetailV2: &kvrpcpb.ScanDetailV2{TotalVersions: math.MaxInt64, RocksdbBlockReadByte: 1},
+		})
+		source := &SnapshotRuntimeStats{}
+		newSnapshotWithRuntimeStats(source).mergeExecDetail(&kvrpcpb.ExecDetailsV2{
+			ScanDetailV2: &kvrpcpb.ScanDetailV2{TotalVersions: 1, RocksdbBlockReadByte: 2},
+		})
+		target.Merge(source)
+		requireInvalid(t, target)
+		internalDetail, _, _, invalid := target.scanDetailSnapshot()
+		require.True(t, invalid)
+		require.Equal(t, uint64(3), internalDetail.RocksdbBlockReadByte)
+	})
+
+	t.Run("record coverage overflow", func(t *testing.T) {
+		for _, tc := range []struct {
+			name   string
+			stats  *SnapshotRuntimeStats
+			detail *kvrpcpb.ExecDetailsV2
+		}{
+			{name: "completed responses", stats: &SnapshotRuntimeStats{completedResponses: math.MaxUint64}},
+			{
+				name: "detail records", stats: &SnapshotRuntimeStats{detailRecords: math.MaxUint64},
+				detail: &kvrpcpb.ExecDetailsV2{ScanDetailV2: &kvrpcpb.ScanDetailV2{}},
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				newSnapshotWithRuntimeStats(tc.stats).mergeExecDetail(tc.detail)
+				requireInvalid(t, tc.stats)
+			})
+		}
+	})
+
+	t.Run("merge coverage overflow", func(t *testing.T) {
+		for _, tc := range []struct {
+			name   string
+			target *SnapshotRuntimeStats
+			source *SnapshotRuntimeStats
+		}{
+			{
+				name:   "completed responses",
+				target: &SnapshotRuntimeStats{completedResponses: math.MaxUint64},
+				source: &SnapshotRuntimeStats{completedResponses: 1},
+			},
+			{
+				name:   "detail records",
+				target: &SnapshotRuntimeStats{detailRecords: math.MaxUint64},
+				source: &SnapshotRuntimeStats{detailRecords: 1},
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				tc.target.Merge(tc.source)
+				requireInvalid(t, tc.target)
+			})
+		}
+	})
 }
 
 func TestCollectBatchGetResponseDataScanDetailCoverage(t *testing.T) {
