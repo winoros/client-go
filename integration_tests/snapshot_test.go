@@ -568,6 +568,11 @@ func (s *testSnapshotSuite) TestSnapshotRuntimeStatsGetAndBatchGetCoverage() {
 	s.Equal(int64(70), detail.ProcessedKeysSize)
 	s.Equal(uint64(2), detailRecords)
 	s.Equal(uint64(3), completedResponses)
+	payloadBytes, payloadRecords, payloadCompletedResponses, valid := runtimeStats.GetPointResponsePayloadAndCoverage()
+	s.True(valid)
+	s.Equal(uint64(len("get")+len(batchGetKey)+len("batch-get")), payloadBytes)
+	s.Equal(uint64(3), payloadRecords)
+	s.Equal(completedResponses, payloadCompletedResponses)
 }
 
 func (s *testSnapshotSuite) TestSnapshotRuntimeStatsExcludesEpochNotMatch() {
@@ -614,6 +619,11 @@ func (s *testSnapshotSuite) TestSnapshotRuntimeStatsExcludesEpochNotMatch() {
 	s.Equal(int64(10), detail.ProcessedKeysSize)
 	s.Equal(uint64(1), detailRecords)
 	s.Equal(uint64(1), completedResponses)
+	payloadBytes, payloadRecords, payloadCompletedResponses, valid := runtimeStats.GetPointResponsePayloadAndCoverage()
+	s.True(valid)
+	s.Equal(uint64(len("value")), payloadBytes)
+	s.Equal(uint64(1), payloadRecords)
+	s.Equal(completedResponses, payloadCompletedResponses)
 }
 
 func (s *testSnapshotSuite) TestSnapshotRuntimeStatsPointGetLockRetryCoverage() {
@@ -674,6 +684,11 @@ func (s *testSnapshotSuite) TestSnapshotRuntimeStatsPointGetLockRetryCoverage() 
 	s.Equal(int64(20), detail.ProcessedKeysSize)
 	s.Equal(uint64(2), detailRecords)
 	s.Equal(uint64(2), completedResponses)
+	payloadBytes, payloadRecords, payloadCompletedResponses, valid := runtimeStats.GetPointResponsePayloadAndCoverage()
+	s.True(valid)
+	s.Equal(uint64(len("old-value")), payloadBytes)
+	s.Equal(uint64(2), payloadRecords)
+	s.Equal(completedResponses, payloadCompletedResponses)
 }
 
 func (s *testSnapshotSuite) TestSnapshotRuntimeStatsAsyncBatchGetMultipleRegionsCoverage() {
@@ -728,6 +743,11 @@ func (s *testSnapshotSuite) TestSnapshotRuntimeStatsAsyncBatchGetMultipleRegions
 	s.Equal(int64(completedResponses*5), detail.TotalKeys)
 	s.Equal(int64(completedResponses*3), detail.ProcessedKeys)
 	s.Equal(int64(completedResponses*30), detail.ProcessedKeysSize)
+	payloadBytes, payloadRecords, payloadCompletedResponses, valid := runtimeStats.GetPointResponsePayloadAndCoverage()
+	s.True(valid)
+	s.Equal(uint64(len(leftKey)+len("left")+len(rightKey)+len("right")), payloadBytes)
+	s.Equal(completedResponses, payloadRecords)
+	s.Equal(completedResponses, payloadCompletedResponses)
 }
 
 func (s *testSnapshotSuite) TestRCRead() {

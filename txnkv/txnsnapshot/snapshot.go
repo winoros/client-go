@@ -401,7 +401,7 @@ type batchGetLockInfo struct {
 func collectBatchGetResponseData(
 	resp *tikvrpc.Response,
 	onKvPair func([]byte, kv.ValueEntry),
-	onDetails func(*kvrpcpb.ExecDetailsV2),
+	onResponse func(*kvrpcpb.ExecDetailsV2, uint64, bool),
 ) (*batchGetLockInfo, error) {
 	if resp.Resp == nil {
 		return nil, errors.WithStack(tikverr.ErrBodyMissing)
@@ -423,11 +423,11 @@ func collectBatchGetResponseData(
 	default:
 		return nil, errors.Errorf("unknown response %T", v)
 	}
-	// A response with a recognized body is complete for scan-detail coverage,
-	// even when it carries no ExecDetailsV2 or contains a key error. Record it
-	// before parsing the payload so retries and their scan details use the same
-	// response-level aggregation boundary.
-	onDetails(details)
+	payloadBytes, payloadValid := batchGetResponsePayloadBytes(data.keyErr, pairs)
+	// A response with a recognized body is complete for scan-detail and payload
+	// coverage, even when it carries no ExecDetailsV2 or contains a key error.
+	// Record both at one response boundary so retries use the same aggregation.
+	onResponse(details, payloadBytes, payloadValid)
 	if data.keyErr != nil {
 		// If a response-level error happens, skip reading pairs.
 		lock, err := txnlock.ExtractLockFromKeyErr(data.keyErr)
@@ -463,6 +463,27 @@ func collectBatchGetResponseData(
 		metrics.ObserveReadSLI(uint64(readKeys), readTime, readSize)
 	}
 	return data, nil
+}
+
+func batchGetResponsePayloadBytes(responseError *kvrpcpb.KeyError, pairs []*kvrpcpb.KvPair) (uint64, bool) {
+	if responseError != nil {
+		return 0, true
+	}
+	var payloadBytes uint64
+	for _, pair := range pairs {
+		if pair.GetError() != nil {
+			continue
+		}
+		pairBytes, ok := checkedAddUint64(uint64(len(pair.GetKey())), uint64(len(pair.GetValue())))
+		if !ok {
+			return 0, false
+		}
+		payloadBytes, ok = checkedAddUint64(payloadBytes, pairBytes)
+		if !ok {
+			return 0, false
+		}
+	}
+	return payloadBytes, true
 }
 
 //go:noinline
@@ -678,7 +699,7 @@ func (s *KVSnapshot) batchGetSingleRegion(bo *retry.Backoffer, batch batchKeys, 
 			continue
 		}
 
-		lockInfo, err := collectBatchGetResponseData(resp, collectF, s.mergeExecDetail)
+		lockInfo, err := collectBatchGetResponseData(resp, collectF, s.mergePointResponse)
 		if err != nil {
 			return err
 		}
@@ -880,7 +901,12 @@ func (s *KVSnapshot) get(ctx context.Context, bo *retry.Backoffer, k []byte, opt
 			return kv.ValueEntry{}, errors.WithStack(tikverr.ErrBodyMissing)
 		}
 		cmdGetResp := resp.Resp.(*kvrpcpb.GetResponse)
-		s.mergeExecDetail(cmdGetResp.ExecDetailsV2)
+		val := cmdGetResp.GetValue()
+		payloadBytes := uint64(len(val))
+		if cmdGetResp.GetError() != nil {
+			payloadBytes = 0
+		}
+		s.mergePointResponse(cmdGetResp.ExecDetailsV2, payloadBytes, true)
 		if cmdGetResp.ExecDetailsV2 != nil {
 			readKeys := len(cmdGetResp.Value)
 			var readTime float64
@@ -892,7 +918,6 @@ func (s *KVSnapshot) get(ctx context.Context, bo *retry.Backoffer, k []byte, opt
 			readSize := float64(cmdGetResp.ExecDetailsV2.GetScanDetailV2().GetProcessedVersionsSize())
 			metrics.ObserveReadSLI(uint64(readKeys), readTime, readSize)
 		}
-		val := cmdGetResp.GetValue()
 		commitTS := cmdGetResp.GetCommitTs()
 		if keyErr := cmdGetResp.GetError(); keyErr != nil {
 			lock, err := txnlock.ExtractLockFromKeyErr(keyErr)
@@ -945,12 +970,16 @@ func (s *KVSnapshot) get(ctx context.Context, bo *retry.Backoffer, k []byte, opt
 }
 
 func (s *KVSnapshot) mergeExecDetail(detail *kvrpcpb.ExecDetailsV2) {
+	s.mergePointResponse(detail, 0, true)
+}
+
+func (s *KVSnapshot) mergePointResponse(detail *kvrpcpb.ExecDetailsV2, payloadBytes uint64, payloadValid bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.mu.stats == nil {
 		return
 	}
-	s.mu.stats.recordScanDetail(detail)
+	s.mu.stats.recordPointResponse(detail, payloadBytes, payloadValid)
 	if detail == nil {
 		return
 	}
@@ -1292,18 +1321,25 @@ type SnapshotRuntimeStats struct {
 	detailRecords      uint64
 	completedResponses uint64
 	scanDetailInvalid  bool
+	payloadBytes       uint64
+	payloadRecords     uint64
+	payloadInvalid     bool
 	timeDetail         util.TimeDetail
 	resolveLockDetail  util.ResolveLockDetail
 }
 
 // Clone implements the RuntimeStats interface.
 func (rs *SnapshotRuntimeStats) Clone() *SnapshotRuntimeStats {
-	scanDetail, detailRecords, completedResponses, scanDetailInvalid := rs.scanDetailSnapshot()
+	scanDetail, detailRecords, completedResponses, scanDetailInvalid,
+		payloadBytes, payloadRecords, payloadInvalid := rs.pointResponseSnapshot()
 	newRs := SnapshotRuntimeStats{
 		scanDetail:         scanDetail,
 		detailRecords:      detailRecords,
 		completedResponses: completedResponses,
 		scanDetailInvalid:  scanDetailInvalid,
+		payloadBytes:       payloadBytes,
+		payloadRecords:     payloadRecords,
+		payloadInvalid:     payloadInvalid,
 		timeDetail:         rs.timeDetail,
 		resolveLockDetail:  rs.resolveLockDetail,
 	}
@@ -1345,7 +1381,8 @@ func (rs *SnapshotRuntimeStats) Merge(other *SnapshotRuntimeStats) {
 			rs.backoffTimes[k] += v
 		}
 	}
-	otherScanDetail, otherDetailRecords, otherCompletedResponses, otherScanDetailInvalid := other.scanDetailSnapshot()
+	otherScanDetail, otherDetailRecords, otherCompletedResponses, otherScanDetailInvalid,
+		otherPayloadBytes, otherPayloadRecords, otherPayloadInvalid := other.pointResponseSnapshot()
 	rs.scanDetailMu.Lock()
 	rs.mergeScanDetailDiagnostics(&otherScanDetail)
 	if otherScanDetailInvalid || !rs.mergePointScanDetailAndCoverage(
@@ -1356,6 +1393,10 @@ func (rs *SnapshotRuntimeStats) Merge(other *SnapshotRuntimeStats) {
 		otherCompletedResponses,
 	) {
 		rs.scanDetailInvalid = true
+		rs.payloadInvalid = true
+	}
+	if otherPayloadInvalid || !rs.mergePointResponsePayload(otherPayloadBytes, otherPayloadRecords) {
+		rs.payloadInvalid = true
 	}
 	rs.scanDetailMu.Unlock()
 	rs.timeDetail.Merge(&other.timeDetail)
@@ -1400,7 +1441,7 @@ func (rs *SnapshotRuntimeStats) String() string {
 	return buf.String()
 }
 
-func (rs *SnapshotRuntimeStats) recordScanDetail(detail *kvrpcpb.ExecDetailsV2) {
+func (rs *SnapshotRuntimeStats) recordPointResponse(detail *kvrpcpb.ExecDetailsV2, payloadBytes uint64, payloadValid bool) {
 	rs.scanDetailMu.Lock()
 	defer rs.scanDetailMu.Unlock()
 
@@ -1411,7 +1452,25 @@ func (rs *SnapshotRuntimeStats) recordScanDetail(detail *kvrpcpb.ExecDetailsV2) 
 	}
 	if !rs.mergePointScanDetailAndCoverageFromPB(detail, detailRecords, 1) {
 		rs.scanDetailInvalid = true
+		rs.payloadInvalid = true
 	}
+	if !payloadValid || !rs.mergePointResponsePayload(payloadBytes, 1) {
+		rs.payloadInvalid = true
+	}
+}
+
+func (rs *SnapshotRuntimeStats) mergePointResponsePayload(payloadBytes, payloadRecords uint64) bool {
+	nextPayloadBytes, ok := checkedAddUint64(rs.payloadBytes, payloadBytes)
+	if !ok {
+		return false
+	}
+	nextPayloadRecords, ok := checkedAddUint64(rs.payloadRecords, payloadRecords)
+	if !ok {
+		return false
+	}
+	rs.payloadBytes = nextPayloadBytes
+	rs.payloadRecords = nextPayloadRecords
+	return true
 }
 
 func (rs *SnapshotRuntimeStats) mergePointScanDetailAndCoverageFromPB(
@@ -1509,9 +1568,15 @@ func (rs *SnapshotRuntimeStats) mergeScanDetailDiagnostics(detail *util.ScanDeta
 }
 
 func (rs *SnapshotRuntimeStats) scanDetailSnapshot() (util.ScanDetail, uint64, uint64, bool) {
+	detail, detailRecords, completedResponses, scanDetailInvalid, _, _, _ := rs.pointResponseSnapshot()
+	return detail, detailRecords, completedResponses, scanDetailInvalid
+}
+
+func (rs *SnapshotRuntimeStats) pointResponseSnapshot() (util.ScanDetail, uint64, uint64, bool, uint64, uint64, bool) {
 	rs.scanDetailMu.RLock()
 	defer rs.scanDetailMu.RUnlock()
-	return rs.scanDetail, rs.detailRecords, rs.completedResponses, rs.scanDetailInvalid
+	return rs.scanDetail, rs.detailRecords, rs.completedResponses, rs.scanDetailInvalid,
+		rs.payloadBytes, rs.payloadRecords, rs.payloadInvalid
 }
 
 // GetScanDetailAndCoverage returns the aggregated Get and BatchGet scan detail
@@ -1552,6 +1617,30 @@ func invalidPointScanDetailAndCoverage() (util.ScanDetail, uint64, uint64) {
 		ProcessedKeys:     -1,
 		ProcessedKeysSize: -1,
 	}, 0, 0
+}
+
+// GetPointResponsePayloadAndCoverage returns the response payload bytes for
+// completed Get, BatchGet, and BufferBatchGet responses. Get contributes its
+// value bytes. Batch responses contribute key plus value bytes for successful
+// pairs; misses and error entries contribute zero bytes but still count as one
+// payload record and one completed response.
+//
+// Transport failures and region errors are handled before this aggregation.
+// A nil receiver or any payload or coverage overflow returns valid=false.
+func (rs *SnapshotRuntimeStats) GetPointResponsePayloadAndCoverage() (
+	payloadBytes uint64,
+	payloadRecords uint64,
+	completedResponses uint64,
+	valid bool,
+) {
+	if rs == nil {
+		return 0, 0, 0, false
+	}
+	_, _, completedResponses, scanDetailInvalid, payloadBytes, payloadRecords, payloadInvalid := rs.pointResponseSnapshot()
+	if scanDetailInvalid || payloadInvalid {
+		return 0, 0, 0, false
+	}
+	return payloadBytes, payloadRecords, completedResponses, true
 }
 
 // GetTimeDetail returns the timeDetail

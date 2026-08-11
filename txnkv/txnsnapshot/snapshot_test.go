@@ -85,6 +85,42 @@ func TestSnapshotRuntimeStatsGetScanDetailAndCoverage(t *testing.T) {
 	require.Zero(t, detail.RocksdbBlockReadByte)
 }
 
+func TestSnapshotRuntimeStatsGetPointResponsePayloadAndCoverage(t *testing.T) {
+	stats := &SnapshotRuntimeStats{}
+	snapshot := newSnapshotWithRuntimeStats(stats)
+
+	payloadBytes, payloadRecords, completedResponses, valid := stats.GetPointResponsePayloadAndCoverage()
+	require.True(t, valid)
+	require.Zero(t, payloadBytes)
+	require.Zero(t, payloadRecords)
+	require.Zero(t, completedResponses)
+
+	snapshot.mergePointResponse(nil, 0, true)
+	snapshot.mergePointResponse(&kvrpcpb.ExecDetailsV2{}, 7, true)
+	payloadBytes, payloadRecords, completedResponses, valid = stats.GetPointResponsePayloadAndCoverage()
+	require.True(t, valid)
+	require.Equal(t, uint64(7), payloadBytes)
+	require.Equal(t, uint64(2), payloadRecords)
+	require.Equal(t, uint64(2), completedResponses)
+
+	clone := stats.Clone()
+	snapshot.mergePointResponse(&kvrpcpb.ExecDetailsV2{}, 11, true)
+	payloadBytes, payloadRecords, completedResponses, valid = clone.GetPointResponsePayloadAndCoverage()
+	require.True(t, valid)
+	require.Equal(t, uint64(7), payloadBytes)
+	require.Equal(t, uint64(2), payloadRecords)
+	require.Equal(t, uint64(2), completedResponses)
+
+	merged := &SnapshotRuntimeStats{}
+	merged.Merge(clone)
+	merged.Merge(stats)
+	payloadBytes, payloadRecords, completedResponses, valid = merged.GetPointResponsePayloadAndCoverage()
+	require.True(t, valid)
+	require.Equal(t, uint64(25), payloadBytes)
+	require.Equal(t, uint64(5), payloadRecords)
+	require.Equal(t, uint64(5), completedResponses)
+}
+
 func TestSnapshotRuntimeStatsScanDetailCloneAndMerge(t *testing.T) {
 	source := &SnapshotRuntimeStats{}
 	sourceSnapshot := newSnapshotWithRuntimeStats(source)
@@ -238,6 +274,28 @@ func TestSnapshotRuntimeStatsScanDetailInvalidSentinel(t *testing.T) {
 			})
 		}
 	})
+
+	t.Run("payload overflow", func(t *testing.T) {
+		for _, stats := range []*SnapshotRuntimeStats{
+			{payloadBytes: math.MaxUint64},
+			{payloadRecords: math.MaxUint64},
+		} {
+			newSnapshotWithRuntimeStats(stats).mergePointResponse(nil, 1, true)
+			payloadBytes, payloadRecords, completedResponses, valid := stats.GetPointResponsePayloadAndCoverage()
+			require.False(t, valid)
+			require.Zero(t, payloadBytes)
+			require.Zero(t, payloadRecords)
+			require.Zero(t, completedResponses)
+			_, _, _, cloneValid := stats.Clone().GetPointResponsePayloadAndCoverage()
+			require.False(t, cloneValid)
+		}
+
+		target := &SnapshotRuntimeStats{payloadBytes: math.MaxUint64}
+		source := &SnapshotRuntimeStats{payloadBytes: 1, payloadRecords: 1, completedResponses: 1}
+		target.Merge(source)
+		_, _, _, valid := target.GetPointResponsePayloadAndCoverage()
+		require.False(t, valid)
+	})
 }
 
 func TestCollectBatchGetResponseDataScanDetailCoverage(t *testing.T) {
@@ -247,14 +305,14 @@ func TestCollectBatchGetResponseDataScanDetailCoverage(t *testing.T) {
 		return collectBatchGetResponseData(
 			&tikvrpc.Response{Resp: resp},
 			func([]byte, kv.ValueEntry) {},
-			snapshot.mergeExecDetail,
+			snapshot.mergePointResponse,
 		)
 	}
 
 	_, err := collectBatchGetResponseData(
 		&tikvrpc.Response{},
 		func([]byte, kv.ValueEntry) {},
-		snapshot.mergeExecDetail,
+		snapshot.mergePointResponse,
 	)
 	require.Error(t, err)
 
@@ -286,6 +344,17 @@ func TestCollectBatchGetResponseDataScanDetailCoverage(t *testing.T) {
 	// The successful retry is a separate completed response because its scan
 	// detail is also a separate record in the aggregate.
 	_, err = collect(&kvrpcpb.BatchGetResponse{
+		Pairs: []*kvrpcpb.KvPair{
+			{Key: []byte("aa"), Value: []byte("bbb")},
+			{Error: &kvrpcpb.KeyError{Locked: &kvrpcpb.LockInfo{
+				PrimaryLock: []byte("locked"),
+				LockVersion: 1,
+				Key:         []byte("locked"),
+				LockTtl:     1,
+				TxnSize:     1,
+				LockType:    kvrpcpb.Op_Put,
+			}}},
+		},
 		ExecDetailsV2: &kvrpcpb.ExecDetailsV2{ScanDetailV2: &kvrpcpb.ScanDetailV2{
 			TotalVersions:         3,
 			ProcessedVersions:     2,
@@ -293,7 +362,9 @@ func TestCollectBatchGetResponseDataScanDetailCoverage(t *testing.T) {
 		}},
 	})
 	require.NoError(t, err)
-	_, err = collect(&kvrpcpb.BufferBatchGetResponse{})
+	_, err = collect(&kvrpcpb.BufferBatchGetResponse{
+		Pairs: []*kvrpcpb.KvPair{{Key: []byte("c"), Value: []byte("dd")}},
+	})
 	require.NoError(t, err)
 
 	_, err = collect(&kvrpcpb.GetResponse{})
@@ -307,6 +378,11 @@ func TestCollectBatchGetResponseDataScanDetailCoverage(t *testing.T) {
 	}, detail)
 	require.Equal(t, uint64(3), detailRecords)
 	require.Equal(t, uint64(5), completedResponses)
+	payloadBytes, payloadRecords, payloadCompletedResponses, valid := stats.GetPointResponsePayloadAndCoverage()
+	require.True(t, valid)
+	require.Equal(t, uint64(8), payloadBytes)
+	require.Equal(t, uint64(5), payloadRecords)
+	require.Equal(t, completedResponses, payloadCompletedResponses)
 }
 
 func TestSnapshotRuntimeStatsConcurrentScanDetailAccess(t *testing.T) {
@@ -326,6 +402,7 @@ func TestSnapshotRuntimeStatsConcurrentScanDetailAccess(t *testing.T) {
 				return
 			default:
 				stats.GetScanDetailAndCoverage()
+				stats.GetPointResponsePayloadAndCoverage()
 				clone := stats.Clone()
 				merged := &SnapshotRuntimeStats{}
 				merged.Merge(clone)
@@ -341,7 +418,9 @@ func TestSnapshotRuntimeStatsConcurrentScanDetailAccess(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := range responsesEach {
-				response := &kvrpcpb.BatchGetResponse{}
+				response := &kvrpcpb.BatchGetResponse{
+					Pairs: []*kvrpcpb.KvPair{{Key: []byte("k"), Value: []byte("vv")}},
+				}
 				if i%2 == 0 {
 					response.ExecDetailsV2 = &kvrpcpb.ExecDetailsV2{ScanDetailV2: &kvrpcpb.ScanDetailV2{
 						TotalVersions:         1,
@@ -354,7 +433,7 @@ func TestSnapshotRuntimeStatsConcurrentScanDetailAccess(t *testing.T) {
 				_, err := collectBatchGetResponseData(
 					&tikvrpc.Response{Resp: response},
 					func([]byte, kv.ValueEntry) {},
-					snapshot.mergeExecDetail,
+					snapshot.mergePointResponse,
 				)
 				if err != nil {
 					errCh <- err
@@ -379,4 +458,9 @@ func TestSnapshotRuntimeStatsConcurrentScanDetailAccess(t *testing.T) {
 	}, detail)
 	require.Equal(t, uint64(workers*responsesEach/2), detailRecords)
 	require.Equal(t, uint64(workers*responsesEach), completedResponses)
+	payloadBytes, payloadRecords, payloadCompletedResponses, valid := stats.GetPointResponsePayloadAndCoverage()
+	require.True(t, valid)
+	require.Equal(t, uint64(workers*responsesEach*3), payloadBytes)
+	require.Equal(t, uint64(workers*responsesEach), payloadRecords)
+	require.Equal(t, completedResponses, payloadCompletedResponses)
 }
